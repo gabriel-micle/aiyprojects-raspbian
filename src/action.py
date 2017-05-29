@@ -21,6 +21,11 @@ import subprocess
 import phue
 from rgbxy import Converter
 
+import re
+import time
+import RPi.GPIO as GPIO
+import youtube_dl
+
 import actionbase
 
 # =============================================================================
@@ -262,7 +267,134 @@ class PowerCommand(object):
 # Makers! Implement your own actions here.
 # =========================================
 
+class YouTubePlayer(object):
 
+    """Plays song from YouTube."""
+    
+    def __init__(self, say, keyword):
+        self.say = say
+        self.keyword = keyword
+        
+    def run(self, voice_command):
+    
+        track = voice_command.replace(self.keyword, '', 1)
+        
+        ydl_opts = {
+            'default_search': 'ytsearch1:',
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+        }
+        
+        try:
+            with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                meta = ydl.extract_info(track, download=False)
+                
+        except Exception as e:
+            self.say('Failed to find ' + track)
+            raise
+        
+        if meta:
+            info = meta['entries'][0]
+            
+            # Keep only words
+            title = re.sub(r'[W+]', '', info['title'])
+            self.say('Now playing ' + title)
+            
+            proc = subprocess.Popen(['mpv', '--no-terminal', info['url']], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+            
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(23, GPIO.IN)
+
+            while True:
+                if proc.poll() is not None:
+                    break
+                if not GPIO.input(23):
+                    proc.kill()
+                    break
+                time.sleep(1)
+
+
+class CustomVolume(object):
+
+    """Changes the volume and says the new level."""
+    
+    GET_VOLUME = r'amixer get Master | grep "Front Left:" | sed "s/.*\[\([0-9]\+\)%\].*/\1/"'
+    SET_VOLUME = 'amixer -q set Master %d%%'
+    
+    UP = 'up'
+    DOWN = 'down'
+    MAX = 'max'
+    MUTE = 'mute'
+
+    def __init__(self, say, keyword):
+        self.say = say
+        self.keyword = keyword
+        self.value = None
+
+    def run(self, voice_command):
+    
+        mode = voice_command.replace(self.keyword, '', 1).strip()
+      
+        if mode == CustomVolume.UP:
+            self.increment(10)
+        elif mode == CustomVolume.DOWN:
+            self.increment(-10)
+        elif mode == CustomVolume.MAX:
+            self.set(100)
+        elif mode == CustomVolume.MUTE:
+            self.set(0)
+        elif mode:
+            match = re.search(r'\d+', mode)
+            if match:
+                vol = int(match.group())
+                self.set(vol)
+            else:
+                self.say('Please specify a value.')
+                return
+        
+        self.tell()
+            
+    def increment(self, value):
+        res = subprocess.check_output(CustomVolume.GET_VOLUME, shell=True).strip()
+        vol = int(res) + value
+        vol = max(0, min(100, vol))
+        self.set(vol)
+    
+    def set(self, value):
+        try:
+            subprocess.call(CustomVolume.SET_VOLUME % value, shell=True)
+            logging.info("volume: %s", value)
+            self.value = value
+        except (ValueError, subprocess.CalledProcessError):
+            logging.exception("Error using amixer to adjust volume.")
+        
+    def tell(self):
+        if not self.value:
+            res = subprocess.check_output(CustomVolume.GET_VOLUME, shell=True).strip()
+            self.value = int(res)
+        self.say(_('Volume at %d %%.') % self.value)
+            
+
+class PowerManagement(object):
+
+    SHUTDOWN = 0
+    RESTART = 1
+
+    def __init__(self, say, mode):
+        self.say = say
+        self.mode = mode
+        
+    def run(self, voice_command):
+        
+        if self.mode == PowerManagement.SHUTDOWN:
+            self.say('Shutting down...')
+            subprocess.Popen('sudo shutdown -h now', shell=True)
+        elif self.mode == PowerManagement.RESTART:
+            self.say('Restarting...')
+            subprocess.Popen('sudo shutdown -r now', shell=True)
+            
+            
 def make_actor(say):
     """Create an actor to carry out the user's commands."""
 
@@ -273,9 +405,9 @@ def make_actor(say):
             say, "ip -4 route get 1 | head -1 | cut -d' ' -f8",
             _('I do not have an ip address assigned to me.')))
 
-    actor.add_keyword(_('volume up'), VolumeControl(say, 10))
-    actor.add_keyword(_('volume down'), VolumeControl(say, -10))
-    actor.add_keyword(_('max volume'), VolumeControl(say, 100))
+    #actor.add_keyword(_('volume up'), VolumeControl(say, 10))
+    #actor.add_keyword(_('volume down'), VolumeControl(say, -10))
+    #actor.add_keyword(_('max volume'), VolumeControl(say, 100))
 
     actor.add_keyword(_('repeat after me'),
                       RepeatAfterMe(say, _('repeat after me')))
@@ -283,6 +415,16 @@ def make_actor(say):
     # =========================================
     # Makers! Add your own voice commands here.
     # =========================================
+    
+    actor.add_keyword(_('shutdown'), PowerManagement(say, PowerManagement.SHUTDOWN))
+    actor.add_keyword(_('power off'), PowerManagement(say, PowerManagement.SHUTDOWN))
+    actor.add_keyword(_('turn off'), PowerManagement(say, PowerManagement.SHUTDOWN))
+    
+    actor.add_keyword(_('restart'), PowerManagement(say, PowerManagement.RESTART))
+    actor.add_keyword(_('reboot'), PowerManagement(say, PowerManagement.RESTART))
+    
+    actor.add_keyword(_('play'), YouTubePlayer(say,_('play')))
+    actor.add_keyword(_('volume'), CustomVolume(say, _('volume')))
 
     actor.add_keyword(_('pi power off'), PowerCommand(say, 'shutdown'))
     actor.add_keyword(_('pi reboot'), PowerCommand(say, 'reboot'))
