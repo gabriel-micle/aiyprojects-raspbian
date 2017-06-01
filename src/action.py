@@ -22,8 +22,9 @@ import phue
 from rgbxy import Converter
 
 import re
-import time
 import RPi.GPIO as GPIO
+import time
+import vlc
 import youtube_dl
 
 import actionbase
@@ -161,24 +162,62 @@ class SpeakShellCommandOutput(object):
 class VolumeControl(object):
 
     """Changes the volume and says the new level."""
-
+    
     GET_VOLUME = r'amixer get Master | grep "Front Left:" | sed "s/.*\[\([0-9]\+\)%\].*/\1/"'
     SET_VOLUME = 'amixer -q set Master %d%%'
+    
+    UP = 'up'
+    DOWN = 'down'
+    MAX = 'max'
+    MUTE = 'mute'
 
-    def __init__(self, say, change):
+    def __init__(self, say, keyword):
         self.say = say
-        self.change = change
+        self.keyword = keyword
+        self.value = None
 
     def run(self, voice_command):
+    
+        mode = voice_command.replace(self.keyword, '', 1).strip()
+      
+        if mode == VolumeControl.UP:
+            self.increment(10)
+        elif mode == VolumeControl.DOWN:
+            self.increment(-10)
+        elif mode == VolumeControl.MAX:
+            self.set(100)
+        elif mode == VolumeControl.MUTE:
+            self.set(0)
+        elif mode:
+            match = re.search(r'\d+', mode)
+            if match:
+                vol = int(match.group())
+                self.set(vol)
+            else:
+                self.say('Please specify a value.')
+                return
+        
+        self.tell()
+            
+    def increment(self, value):
         res = subprocess.check_output(VolumeControl.GET_VOLUME, shell=True).strip()
+        vol = int(res) + value
+        self.set(vol)
+    
+    def set(self, value):
+        vol = max(0, min(100, value))
         try:
-            logging.info("volume: %s", res)
-            vol = int(res) + self.change
-            vol = max(0, min(100, vol))
             subprocess.call(VolumeControl.SET_VOLUME % vol, shell=True)
-            self.say(_('Volume at %d %%.') % vol)
+            logging.info("volume: %s", vol)
+            self.value = vol
         except (ValueError, subprocess.CalledProcessError):
             logging.exception("Error using amixer to adjust volume.")
+        
+    def tell(self):
+        if not self.value:
+            res = subprocess.check_output(VolumeControl.GET_VOLUME, shell=True).strip()
+            self.value = int(res)
+        self.say(_('Volume at %d %%.') % self.value)
 
 
 # Example: Repeat after me
@@ -248,15 +287,18 @@ class ChangeLightColor(object):
 class PowerCommand(object):
     """Shutdown or reboot the pi"""
 
+    SHUTDOWN = 0
+    RESTART = 1
+    
     def __init__(self, say, command):
         self.say = say
         self.command = command
 
     def run(self, voice_command):
-        if self.command == "shutdown":
+        if self.command == self.SHUTDOWN:
             self.say("Shutting down, goodbye")
             subprocess.call("sudo shutdown now", shell=True)
-        elif self.command == "reboot":
+        elif self.command == self.RESTART:
             self.say("Rebooting")
             subprocess.call("sudo shutdown -r now", shell=True)
         else:
@@ -274,6 +316,8 @@ class YouTubePlayer(object):
     def __init__(self, say, keyword):
         self.say = say
         self.keyword = keyword
+        self.instance = vlc.get_default_instance()
+        self.player = self.instance.media_player_new()
         
     def run(self, voice_command):
     
@@ -292,109 +336,31 @@ class YouTubePlayer(object):
                 
         except Exception as e:
             self.say('Failed to find ' + track)
-            raise
         
         if meta:
             info = meta['entries'][0]
-            
+       
+            media = self.instance.media_new(info['url'])
+            self.player.set_media(media)
+       
             # Keep only words
             title = re.sub(r'[W+]', '', info['title'])
             self.say('Now playing ' + title)
             
-            proc = subprocess.Popen(['mpv', '--no-terminal', info['url']], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+            self.player.play()
             
             GPIO.setmode(GPIO.BCM)
-            GPIO.setup(23, GPIO.IN)
+            GPIO.setup(23, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
             while True:
-                if proc.poll() is not None:
+                if self.player.get_state() == vlc.State.Ended:
                     break
-                if not GPIO.input(23):
-                    proc.kill()
+                if GPIO.input(23) == 0:
+                    self.player.stop()
                     break
                 time.sleep(1)
 
 
-class CustomVolume(object):
-
-    """Changes the volume and says the new level."""
-    
-    GET_VOLUME = r'amixer get Master | grep "Front Left:" | sed "s/.*\[\([0-9]\+\)%\].*/\1/"'
-    SET_VOLUME = 'amixer -q set Master %d%%'
-    
-    UP = 'up'
-    DOWN = 'down'
-    MAX = 'max'
-    MUTE = 'mute'
-
-    def __init__(self, say, keyword):
-        self.say = say
-        self.keyword = keyword
-        self.value = None
-
-    def run(self, voice_command):
-    
-        mode = voice_command.replace(self.keyword, '', 1).strip()
-      
-        if mode == CustomVolume.UP:
-            self.increment(10)
-        elif mode == CustomVolume.DOWN:
-            self.increment(-10)
-        elif mode == CustomVolume.MAX:
-            self.set(100)
-        elif mode == CustomVolume.MUTE:
-            self.set(0)
-        elif mode:
-            match = re.search(r'\d+', mode)
-            if match:
-                vol = int(match.group())
-                self.set(vol)
-            else:
-                self.say('Please specify a value.')
-                return
-        
-        self.tell()
-            
-    def increment(self, value):
-        res = subprocess.check_output(CustomVolume.GET_VOLUME, shell=True).strip()
-        vol = int(res) + value
-        vol = max(0, min(100, vol))
-        self.set(vol)
-    
-    def set(self, value):
-        try:
-            subprocess.call(CustomVolume.SET_VOLUME % value, shell=True)
-            logging.info("volume: %s", value)
-            self.value = value
-        except (ValueError, subprocess.CalledProcessError):
-            logging.exception("Error using amixer to adjust volume.")
-        
-    def tell(self):
-        if not self.value:
-            res = subprocess.check_output(CustomVolume.GET_VOLUME, shell=True).strip()
-            self.value = int(res)
-        self.say(_('Volume at %d %%.') % self.value)
-            
-
-class PowerManagement(object):
-
-    SHUTDOWN = 0
-    RESTART = 1
-
-    def __init__(self, say, mode):
-        self.say = say
-        self.mode = mode
-        
-    def run(self, voice_command):
-        
-        if self.mode == PowerManagement.SHUTDOWN:
-            self.say('Shutting down...')
-            subprocess.Popen('sudo shutdown -h now', shell=True)
-        elif self.mode == PowerManagement.RESTART:
-            self.say('Restarting...')
-            subprocess.Popen('sudo shutdown -r now', shell=True)
-            
-            
 def make_actor(say):
     """Create an actor to carry out the user's commands."""
 
@@ -405,29 +371,21 @@ def make_actor(say):
             say, "ip -4 route get 1 | head -1 | cut -d' ' -f8",
             _('I do not have an ip address assigned to me.')))
 
-    #actor.add_keyword(_('volume up'), VolumeControl(say, 10))
-    #actor.add_keyword(_('volume down'), VolumeControl(say, -10))
-    #actor.add_keyword(_('max volume'), VolumeControl(say, 100))
-
     actor.add_keyword(_('repeat after me'),
                       RepeatAfterMe(say, _('repeat after me')))
 
     # =========================================
     # Makers! Add your own voice commands here.
     # =========================================
+
+    actor.add_keyword(_('power off'), PowerCommand(say, PowerCommand.SHUTDOWN))
+    actor.add_keyword(_('turn off'), PowerCommand(say, PowerCommand.SHUTDOWN))
     
-    actor.add_keyword(_('shutdown'), PowerManagement(say, PowerManagement.SHUTDOWN))
-    actor.add_keyword(_('power off'), PowerManagement(say, PowerManagement.SHUTDOWN))
-    actor.add_keyword(_('turn off'), PowerManagement(say, PowerManagement.SHUTDOWN))
-    
-    actor.add_keyword(_('restart'), PowerManagement(say, PowerManagement.RESTART))
-    actor.add_keyword(_('reboot'), PowerManagement(say, PowerManagement.RESTART))
+    actor.add_keyword(_('reboot'), PowerCommand(say, PowerCommand.RESTART))
+    actor.add_keyword(_('restart'), PowerCommand(say, PowerCommand.RESTART))
     
     actor.add_keyword(_('play'), YouTubePlayer(say,_('play')))
-    actor.add_keyword(_('volume'), CustomVolume(say, _('volume')))
-
-    actor.add_keyword(_('pi power off'), PowerCommand(say, 'shutdown'))
-    actor.add_keyword(_('pi reboot'), PowerCommand(say, 'reboot'))
+    actor.add_keyword(_('volume'), VolumeControl(say, _('volume')))
 
     return actor
 
