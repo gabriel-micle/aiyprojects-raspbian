@@ -197,7 +197,7 @@ class VolumeControl(object):
                 self.say('Please specify a value.')
                 return
         
-        self.tell()
+        #self.tell()
             
     def increment(self, value):
         res = subprocess.check_output(VolumeControl.GET_VOLUME, shell=True).strip()
