@@ -181,7 +181,7 @@ class VolumeControl(object):
 
     def run(self, voice_command):
     
-        mode = voice_command.replace(self.keyword, '', 1).strip()
+        mode = voice_command.lower().replace(self.keyword, '', 1).strip()
       
         if mode == VolumeControl.UP:
             self.increment(10)
@@ -240,7 +240,7 @@ class RepeatAfterMe(object):
     def run(self, voice_command):
         # The command still has the 'repeat after me' keyword, so we need to
         # remove it before saying whatever is left.
-        to_repeat = voice_command.replace(self.keyword, '', 1)
+        to_repeat = voice_command.lower().replace(self.keyword, '', 1)
         self.say(to_repeat)
 
 
@@ -319,12 +319,16 @@ class YouTubePlayer(object):
     def __init__(self, say, keyword):
         self.say = say
         self.keyword = keyword
-        self.instance = vlc.get_default_instance()
-        self.player = self.instance.media_player_new()
+        self._init_player()
+        self._init_gpio(23)
         
     def run(self, voice_command):
     
-        track = voice_command.replace(self.keyword, '', 1)
+        track = voice_command.lower().replace(self.keyword, '', 1).strip()
+        
+        if not track:
+            self.say('Please specify a song')
+            return
         
         ydl_opts = {
             'default_search': 'ytsearch1:',
@@ -333,136 +337,210 @@ class YouTubePlayer(object):
             'quiet': True,
         }
         
+        meta = None
         try:
             with youtube_dl.YoutubeDL(ydl_opts) as ydl:
                 meta = ydl.extract_info(track, download=False)
-                
         except Exception as e:
             self.say('Failed to find ' + track)
             return
         
         if not meta:
+            self.say('Failed to find ' + track)
             return
             
-        info = meta['entries'][0]
+        track_info = meta['entries'][0]
+        if not track_info:
+            self.say('Failed to find ' + track)
+            return
    
-        media = self.instance.media_new(info['url'])
+        url = track_info['url']
+        logging.debug(url)
+        media = self.instance.media_new(url)
         self.player.set_media(media)
    
-        # Keep only words
-        title = re.sub(r'[W+]', '', info['title'])
-        self.say('Now playing ' + title)
+        # Keep only words and use negative lookahead and lookbehind to remove '_'
+        pattern = r'(?!_)\w+(?<!_)'
+        self.now_playing = ' '.join(re.findall(pattern, track_info['title']))
+        logging.info(self.now_playing)
+        self.say('Now playing ' + self.now_playing)
         
         self.player.play()
-        
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(23, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-        while True:
-            if self.player.get_state() == vlc.State.Ended:
-                break
-            if GPIO.input(23) == 0:
-                self.player.stop()
-                break
+        self.done = False
+        while not self.done:
             time.sleep(1)
+            
+    def _init_gpio(self, channel, polarity=GPIO.FALLING, pull_up_down=GPIO.PUD_UP):
+        self.input_value = polarity == GPIO.RISING
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(channel, GPIO.IN, pull_up_down=pull_up_down)
+        try:
+            GPIO.add_event_detect(channel, polarity, callback=self._on_input_event)
+        except RuntimeError:
+            logging.info('Event already added')
+            GPIO.add_event_callback(channel, self._on_input_event)
+            
+    def _init_player(self):
+        self.now_playing = None
+        self.done = False
+        self.instance = vlc.get_default_instance()
+        self.player = self.instance.media_player_new()
+        events = self.player.event_manager()
+        events.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_player_event)
+        events.event_attach(vlc.EventType.MediaPlayerEncounteredError, self._on_player_event)
+    
+    def _on_input_event(self, channel):
+        if GPIO.input(channel) == self.input_value:
+            self.player.stop()
+            self.done = True
 
+    def _on_player_event(self, event):
+        if event.type == vlc.EventType.MediaPlayerEndReached:
+            self.done = True
+        elif event.type == vlc.EventType.MediaPlayerEncounteredError:
+            self.say("Can't play " + self.now_playing)
+            self.done = True
+        
 
 class TuneInRadio(object):
 
     """Plays a radio stream from TuneIn radio"""
     
     BASE_URL = 'http://tunein.com/'
-    SEARCH_STATIONS = 'Stations'
+    FILTER_STATIONS = 'Stations'
     
     def __init__(self, say, keyword):
         self.say = say
         self.keyword = keyword
-        self.instance = vlc.get_default_instance()
-        self.player = self.instance.media_player_new()
+        self._init_player()
+        self._init_gpio(23)
         
     def run(self, voice_command):
         
-        searchstr = voice_command.replace(self.keyword, '', 1).strip()
-        
-        stations = self.search(searchstr)
+        search_str = voice_command.lower().replace(self.keyword, '', 1).strip()
+     
+        if not search_str:
+            self.say('Please specify a station')
+            return
+     
+        stations = self._search(search_str)
         if not stations:
-            self.say('Didn\'t find any stations')
+            self.say("Didn't find any stations")
             return
             
         station = stations[0]
-        
-        streamurl = self.get_stream(station['Id'])
-        if not streamurl:
-            self.say('Didn\'t find any streams')
+        url = self._get_stream_url(station['Id'])
+        if not url:
+            self.say("Didn't find any streams")
             return
-            
-        media = self.instance.media_new(streamurl)
+        
+        logging.debug(url)
+        media = self.instance.media_new(url)
         self.player.set_media(media)
         
-        self.say('Now playing ' + station['Title'])
+        self.now_playing = station['Title']
+        logging.info(self.now_playing)
+        self.say('Now playing ' + self.now_playing)
         
         self.player.play()
-            
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(23, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-        while True:
-            if self.player.get_state() == vlc.State.Ended:
-                break
-            if GPIO.input(23) == 0:
-                self.player.stop()
-                break
+        self.done = False
+        while not self.done:
             time.sleep(1)
-       
-        
-    def search(self, searchstr, searchfilter=SEARCH_STATIONS):
+            
+    def _init_gpio(self, channel, polarity=GPIO.FALLING, pull_up_down=GPIO.PUD_UP):
+        self.input_value = polarity == GPIO.RISING
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(channel, GPIO.IN, pull_up_down=pull_up_down)
+        try:
+            GPIO.add_event_detect(channel, polarity, callback=self._on_input_event)
+        except RuntimeError:
+            logging.info('Event already added')
+            GPIO.add_event_callback(channel, self._on_input_event)
     
-        url = TuneInRadio.BASE_URL + 'search/?query=' + urllib.parse.quote(searchstr)
+    def _init_player(self):
+        self.now_playing = None
+        self.done = False
+        self.instance = vlc.get_default_instance()
+        self.player = self.instance.media_player_new()
+        events = self.player.event_manager()
+        events.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_player_event)
+        events.event_attach(vlc.EventType.MediaPlayerEncounteredError, self._on_player_event)
+    
+    def _on_input_event(self, channel):
+        if GPIO.input(channel) == self.input_value:
+            self.player.stop()
+            self.done = True
+            
+    def _on_player_event(self, event):
+        if event.type == vlc.EventType.MediaPlayerEndReached:
+            self.done = True
+        elif event.type == vlc.EventType.MediaPlayerEncounteredError:
+            self.say("Can't play " + self.now_playing)
+            self.done = True
+
+    def _search(self, search_str, search_filter=FILTER_STATIONS):
+    
+        ret_results= None
+        
+        url = TuneInRadio.BASE_URL + 'search/?query=' + urllib.parse.quote(search_str)
+        logging.debug(url)
         req = urllib.request.Request(url)
-        f = urllib.request.urlopen(req)
-        xmlstr = f.read().decode('ascii', 'ignore')
-        f.close()
+        fp = urllib.request.urlopen(req)
+        xml_str = fp.read().decode('ascii', 'ignore')
+        fp.close()
         
         pattern = r'TuneIn.payload = (\{.*\})'
-        result = re.search(pattern, xmlstr)
+        result = re.search(pattern, xml_str)
+        
+        if not result:
+            return None
         
         payload = result.group(1)
         result = json.loads(payload)
         
         categories = result['ContainerGuideItems']['containers']
         for category in categories:
-            if category["Title"] == searchfilter:
-                stations = category['GuideItems']
+            if category['Title'] == search_filter:
+                ret_results = category['GuideItems']
                 break;
         
-        return stations
+        return ret_results
                 
-    def get_stream(self, stationid):
+    def _get_stream_url(self, station_id):
     
-        url = TuneInRadio.BASE_URL + 'station/?stationId=' + str(stationid)
+        url = TuneInRadio.BASE_URL + 'station/?stationId=' + str(station_id)
+        logging.debug(url)
         req = urllib.request.Request(url)
-        f = urllib.request.urlopen(req)
-        xmlstr = f.read().decode('ascii', 'ignore')
-        f.close()
+        fp = urllib.request.urlopen(req)
+        xml_str = fp.read().decode('ascii', 'ignore')
+        fp.close()
         
-        pattern = r'\"StreamUrl\":\"(.*?)\"'
-        result = re.search(pattern, xmlstr)
-        jsonurl = 'http:' + result.group(1)
+        pattern = r'"StreamUrl":"(.*?)"'
+        result = re.search(pattern, xml_str)
         
-        streams = self.get_streams_internal(jsonurl)
+        if not result.group(1):
+            return None
         
+        json_url = 'http:' + result.group(1)
+        streams = self._get_stream_list(json_url)
+        
+        if not streams:
+            return None
+            
         stream = streams[0]
         return stream['Url']
         
-    def get_streams_internal(self, streamurl):
+    def _get_stream_list(self, url):
         
-        req = urllib.request.Request(streamurl)
-        f = urllib.request.urlopen(req)
-        jsonstr = f.read().decode('ascii', 'ignore')
-        f.close()
+        logging.debug(url)
+        req = urllib.request.Request(url)
+        fp = urllib.request.urlopen(req)
+        json_str = fp.read().decode('ascii', 'ignore')
+        fp.close()
         
-        result = json.loads(jsonstr)
-        
+        result = json.loads(json_str)
         return result['Streams']
         
 

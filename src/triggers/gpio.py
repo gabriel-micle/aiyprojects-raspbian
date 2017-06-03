@@ -45,7 +45,10 @@ class GpioTrigger(Trigger):
 
     def start(self):
         if not self.event_detect_added:
-            GPIO.add_event_detect(self.channel, self.polarity, callback=self.debounce)
+            try:
+                GPIO.add_event_detect(self.channel, self.polarity, callback=self.debounce)
+            except RuntimeError:
+                GPIO.add_event_callback(self.channel, self.debounce)
             self.event_detect_added = True
 
     def debounce(self, _):
