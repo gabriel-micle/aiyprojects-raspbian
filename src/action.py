@@ -21,9 +21,12 @@ import subprocess
 import phue
 from rgbxy import Converter
 
+import json 
+import pprint
 import re
 import RPi.GPIO as GPIO
 import time
+import urllib
 import vlc
 import youtube_dl
 
@@ -197,7 +200,7 @@ class VolumeControl(object):
                 self.say('Please specify a value.')
                 return
         
-        #self.tell()
+        self.tell()
             
     def increment(self, value):
         res = subprocess.check_output(VolumeControl.GET_VOLUME, shell=True).strip()
@@ -336,30 +339,132 @@ class YouTubePlayer(object):
                 
         except Exception as e:
             self.say('Failed to find ' + track)
+            return
         
-        if meta:
-            info = meta['entries'][0]
-       
-            media = self.instance.media_new(info['url'])
-            self.player.set_media(media)
-       
-            # Keep only words
-            title = re.sub(r'[W+]', '', info['title'])
-            self.say('Now playing ' + title)
+        if not meta:
+            return
             
-            self.player.play()
+        info = meta['entries'][0]
+   
+        media = self.instance.media_new(info['url'])
+        self.player.set_media(media)
+   
+        # Keep only words
+        title = re.sub(r'[W+]', '', info['title'])
+        self.say('Now playing ' + title)
+        
+        self.player.play()
+        
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(23, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+        while True:
+            if self.player.get_state() == vlc.State.Ended:
+                break
+            if GPIO.input(23) == 0:
+                self.player.stop()
+                break
+            time.sleep(1)
+
+
+class TuneInRadio(object):
+
+    """Plays a radio stream from TuneIn radio"""
+    
+    BASE_URL = 'http://tunein.com/'
+    SEARCH_STATIONS = 'Stations'
+    
+    def __init__(self, say, keyword):
+        self.say = say
+        self.keyword = keyword
+        self.instance = vlc.get_default_instance()
+        self.player = self.instance.media_player_new()
+        
+    def run(self, voice_command):
+        
+        searchstr = voice_command.replace(self.keyword, '', 1).strip()
+        
+        stations = self.search(searchstr)
+        if not stations:
+            self.say('Didn\'t find any stations')
+            return
             
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(23, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        station = stations[0]
+        
+        streamurl = self.get_stream(station['Id'])
+        if not streamurl:
+            self.say('Didn\'t find any streams')
+            return
+            
+        media = self.instance.media_new(streamurl)
+        self.player.set_media(media)
+        
+        self.say('Now playing ' + station['Title'])
+        
+        self.player.play()
+            
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(23, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-            while True:
-                if self.player.get_state() == vlc.State.Ended:
-                    break
-                if GPIO.input(23) == 0:
-                    self.player.stop()
-                    break
-                time.sleep(1)
-
+        while True:
+            if self.player.get_state() == vlc.State.Ended:
+                break
+            if GPIO.input(23) == 0:
+                self.player.stop()
+                break
+            time.sleep(1)
+       
+        
+    def search(self, searchstr, searchfilter=SEARCH_STATIONS):
+    
+        url = TuneInRadio.BASE_URL + 'search/?query=' + urllib.parse.quote(searchstr)
+        req = urllib.request.Request(url)
+        f = urllib.request.urlopen(req)
+        xmlstr = f.read().decode('ascii', 'ignore')
+        f.close()
+        
+        pattern = r'TuneIn.payload = (\{.*\})'
+        result = re.search(pattern, xmlstr)
+        
+        payload = result.group(1)
+        result = json.loads(payload)
+        
+        categories = result['ContainerGuideItems']['containers']
+        for category in categories:
+            if category["Title"] == searchfilter:
+                stations = category['GuideItems']
+                break;
+        
+        return stations
+                
+    def get_stream(self, stationid):
+    
+        url = TuneInRadio.BASE_URL + 'station/?stationId=' + str(stationid)
+        req = urllib.request.Request(url)
+        f = urllib.request.urlopen(req)
+        xmlstr = f.read().decode('ascii', 'ignore')
+        f.close()
+        
+        pattern = r'\"StreamUrl\":\"(.*?)\"'
+        result = re.search(pattern, xmlstr)
+        jsonurl = 'http:' + result.group(1)
+        
+        streams = self.get_streams_internal(jsonurl)
+        
+        stream = streams[0]
+        return stream['Url']
+        
+    def get_streams_internal(self, streamurl):
+        
+        req = urllib.request.Request(streamurl)
+        f = urllib.request.urlopen(req)
+        jsonstr = f.read().decode('ascii', 'ignore')
+        f.close()
+        
+        result = json.loads(jsonstr)
+        
+        return result['Streams']
+        
 
 def make_actor(say):
     """Create an actor to carry out the user's commands."""
@@ -384,8 +489,9 @@ def make_actor(say):
     actor.add_keyword(_('reboot'), PowerCommand(say, PowerCommand.RESTART))
     actor.add_keyword(_('restart'), PowerCommand(say, PowerCommand.RESTART))
     
-    actor.add_keyword(_('play'), YouTubePlayer(say,_('play')))
     actor.add_keyword(_('volume'), VolumeControl(say, _('volume')))
+    actor.add_keyword(_('play'), YouTubePlayer(say,_('play')))
+    actor.add_keyword(_('radio'), TuneInRadio(say,_('radio')))
 
     return actor
 
